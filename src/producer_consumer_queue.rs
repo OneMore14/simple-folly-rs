@@ -1,4 +1,5 @@
 use std::cell::{Cell, UnsafeCell};
+use std::f32::consts::E;
 use std::mem::MaybeUninit;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize};
@@ -30,9 +31,8 @@ struct RingBuffer<T> {
 impl<T> RingBuffer<T> {
 
     fn new(cap: usize) -> Self {
-        assert!(cap >= 1, "cap can't be zero");
-        let cap = cap + 1;
-        let buffer: Box<[Slot<T>]> = (0..cap)
+
+        let buffer: Box<[Slot<T>]> = (0..=cap)
             .map(|_| {
                 Slot::uninit()
             })
@@ -45,34 +45,12 @@ impl<T> RingBuffer<T> {
         }
     }
 
-    fn recv(&self) -> Result<T, ()> {
-        let current_read = self.read_idx.load(Relaxed);
-        if current_read == self.write_idx.load(Acquire) {
-            return Err(());
-        }
-        let mut next_record = current_read + 1;
-        if next_record == self.size {
-            next_record = 0;
-        }
-        let slot = unsafe { self.buffer.get_unchecked(current_read) };
-        let val = unsafe { slot.val.get().read().assume_init() };
-        self.read_idx.store(next_record,Release);
-        Ok(val)
+    fn get_slot_ptr(&self, pos: usize) -> *mut MaybeUninit<T> {
+        unsafe { self.buffer.get_unchecked(pos).val.get() }
     }
 
-    fn send(&self, val: T) -> Result<(), T> {
-        let current_write = self.write_idx.load(Relaxed);
-        let mut next_record = current_write + 1;
-        if next_record == self.size {
-            next_record = 0;
-        }
-        if next_record != self.read_idx.load(Acquire) {
-            let slot = unsafe { self.buffer.get_unchecked(current_write) };
-            unsafe {slot.val.get().write(MaybeUninit::new(val));}
-            self.write_idx.store(next_record, Release);
-            return Ok(());
-        }
-        Err(val)
+    unsafe fn read_slot(&self, pos: usize) -> T {
+        self.get_slot_ptr(pos).read().assume_init()
     }
 
     fn is_empty(&self) -> bool {
@@ -97,9 +75,21 @@ impl<T> RingBuffer<T> {
 
 impl<T> Drop for RingBuffer<T> {
     fn drop(&mut self) {
-        while !self.is_empty() {
-            self.recv().unwrap();
+        let mut head = self.read_idx.load(Acquire);
+        let tail = self.write_idx.load(Acquire);
+        while head != tail {
+            unsafe { let _ = self.read_slot(head);}
+            head = get_next_pos(head, self.size);
         }
+    }
+}
+
+#[inline]
+fn get_next_pos(pos: usize, size: usize) -> usize {
+    if pos == size {
+        0
+    } else {
+        pos + 1
     }
 }
 
@@ -111,31 +101,39 @@ pub struct Sender<T> {
 
     // inaccurate
     cached_tail: Cell<usize>,
+
+    size: usize,
 }
 
 impl<T> Sender<T> {
     pub fn send(&self, val: T) -> Result<(), T> {
-        self.buffer.send(val)
+        if let Some(pos) = self.write_pos() {
+            unsafe { self.buffer.get_slot_ptr(pos).write(MaybeUninit::new(val)); }
+            let next_pos = get_next_pos(pos, self.size);
+            self.buffer.write_idx.store(next_pos, Release);
+            self.cached_tail.set(next_pos);
+            Ok(())
+        } else {
+            Err(val)
+        }
     }
 
     fn write_pos(&self) -> Option<usize> {
-        let mut tail = self.cached_tail.get();
-        let head = self.cached_head.get() + 1;
-        if tail == self.buffer.size {
-            tail = 0;
-        }
+        let tail = self.cached_tail.get();
+        let next_tail = get_next_pos(tail, self.size);
+        let mut head = self.cached_head.get();
+
         // may be full
-        if tail == head {
-            tail = self.buffer.write_idx.load(Acquire);
-            if tail == self.buffer.size {
-                tail = 0;
-            }
-            if tail == head {
+        if next_tail == head {
+            head = self.buffer.read_idx.load(Acquire);
+            self.cached_head.set(head);
+            if next_tail == head {
                 return None;
             }
         }
         Some(tail)
     }
+
 }
 
 unsafe impl<T: Send> Send for Sender<T> {}
@@ -149,11 +147,36 @@ pub struct Receiver<T> {
 
     // accurate
     cached_tail: Cell<usize>,
+
+    size: usize,
 }
 
 impl<T> Receiver<T> {
     pub fn recv(&self) -> Result<T, ()> {
-        self.buffer.recv()
+        if let Some(pos) = self.read_pos() {
+            let val = unsafe { self.buffer.read_slot(pos) };
+            let next_read = get_next_pos(pos, self.size);
+            self.buffer.read_idx.store(next_read, Release);
+            self.cached_head.set(next_read);
+            return Ok(val);
+        } else {
+            Err(())
+        }
+    }
+
+    pub fn read_pos(&self) -> Option<usize> {
+        let tail = self.cached_tail.get();
+        let head = self.cached_head.get();
+
+        // may be empty
+        if head == tail {
+            let tail = self.buffer.write_idx.load(Acquire);
+            self.cached_tail.set(tail);
+            if head == tail {
+                return None;
+            }
+        }
+        Some(head)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -166,16 +189,20 @@ impl<T> !Sync for Receiver<T> {}
 
 pub fn new<T>(cap: usize) -> (Sender<T>, Receiver<T>) {
 
-    let buffer = Arc::new(RingBuffer::new(cap));
+    let size = cap + 1;
+
+    let buffer = Arc::new(RingBuffer::new(size));
     let sender = Sender {
         buffer: buffer.clone(),
         cached_head: Cell::new(0),
         cached_tail: Cell::new(0),
+        size,
     };
     let receiver = Receiver {
         buffer: buffer.clone(),
         cached_head: Cell::new(0),
         cached_tail: Cell::new(0),
+        size,
     };
     (sender, receiver)
 }
@@ -187,23 +214,29 @@ mod tests {
 
     #[test]
     fn basic() {
-        let (sender, receiver) = new::<i32>(10);
+        let (sender, receiver) = new::<usize>(1000);
+        let n = 100_000_000;
         let t1 = std::thread::spawn(move || {
-            for i in 1..=5 {
-                sender.send(i).unwrap();
+            for i in 0..n {
+                while sender.send(i).is_err() {
+
+                };
             }
         });
         let t2 = std::thread::spawn(move || {
             let mut list = vec![];
-            while list.len() < 5 {
+            while list.len() < n {
                 if let Ok(val) = receiver.recv() {
                     list.push(val);
                 }
             }
-            assert_eq!(list, vec![1, 2, 3, 4, 5]);
+            list
         });
         t1.join().unwrap();
-        t2.join().unwrap();
+        let v = t2.join().unwrap();
+        for (i, value) in v.into_iter().enumerate() {
+            assert_eq!(i, value);
+        }
     }
 
     #[test]
