@@ -1,9 +1,8 @@
 use std::cell::{Cell, UnsafeCell};
-use std::f32::consts::E;
 use std::mem::MaybeUninit;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize};
-use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use std::sync::atomic::Ordering::{Acquire, Release};
 
 use crossbeam_utils::CachePadded;
 
@@ -53,10 +52,12 @@ impl<T> RingBuffer<T> {
         self.get_slot_ptr(pos).read().assume_init()
     }
 
+    #[allow(dead_code)]
     fn is_empty(&self) -> bool {
         self.read_idx.load(Acquire) == self.write_idx.load(Acquire)
     }
 
+    #[allow(dead_code)]
     fn is_full(&self) -> bool {
         let mut next_record = self.write_idx.load(Acquire) + 1;
         if next_record == self.size {
@@ -68,6 +69,7 @@ impl<T> RingBuffer<T> {
         true
     }
 
+    #[allow(dead_code)]
     fn capacity(&self) -> usize {
         self.size - 1
     }
@@ -152,15 +154,15 @@ pub struct Receiver<T> {
 }
 
 impl<T> Receiver<T> {
-    pub fn recv(&self) -> Result<T, ()> {
+    pub fn recv(&self) -> Result<T, SPSCError> {
         if let Some(pos) = self.read_pos() {
             let val = unsafe { self.buffer.read_slot(pos) };
             let next_read = get_next_pos(pos, self.size);
             self.buffer.read_idx.store(next_read, Release);
             self.cached_head.set(next_read);
-            return Ok(val);
+            Ok(val)
         } else {
-            Err(())
+            Err(SPSCError::Full)
         }
     }
 
@@ -205,6 +207,10 @@ pub fn new<T>(cap: usize) -> (Sender<T>, Receiver<T>) {
         size,
     };
     (sender, receiver)
+}
+
+pub enum SPSCError {
+    Full
 }
 
 #[cfg(test)]
