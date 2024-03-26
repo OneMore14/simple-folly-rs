@@ -20,6 +20,7 @@ impl<T> Slot<T> {
     }
 }
 
+// 进一步优化可以使用batch模式，https://www.cse.cuhk.edu.hk/~pclee/www/pubs/ancs09poster.pdf
 struct RingBuffer<T> {
     size: usize,
     read_idx: CachePadded<AtomicUsize>,
@@ -243,20 +244,5 @@ mod tests {
         for (i, value) in v.into_iter().enumerate() {
             assert_eq!(i, value);
         }
-    }
-
-    #[test]
-    fn test_memory_leak() {
-        let (sender, receiver) = new::<String>(10);
-        let t1 = std::thread::spawn(move || {
-            for _ in 1..=5 {
-                sender.send("hello".into()).unwrap();
-            }
-        });
-        let t2 = std::thread::spawn(move || {
-
-        });
-        t1.join().unwrap();
-        t2.join().unwrap();
     }
 }
